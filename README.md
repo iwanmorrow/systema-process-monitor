@@ -1,266 +1,57 @@
-# SYSTEMA Processes
+on.py`
+specifically for this purpose). Covered: identity and PID reuse, heuristic rules,
+hashing and caching, workers (including failing callbacks), history (memory
+limits, SQLite, bursts, restarts), the orchestrator (WMI/polling deduplication,
+handling `EXIT` for previously tracked processes, PID reuse between ticks,
+`<n/a>` for hashes), and i18n boundaries. Not covered by automated tests: the
+entire GUI (verified via manual execution) and the `windows/*` module.
 
-Модуль наблюдения за процессами в составе SYSTEMA (System Analysis &
-Monitoring Architecture). Это не диспетчер задач, а инструмент наблюдения:
-показывает, что происходит, сохраняет, что произошло, связывает процессы в
-цепочки происхождения и **объясняет, почему** что-то показалось
-подозрительным — вместо готового вердикта.
+## Checklist for a real Windows environment (not yet executed)
 
-Это defensive-инструмент мониторинга. Он не антивирус и не forensic-комплекс.
+Run with administrator privileges, in the following order:
 
-Python 3.10+, tkinter/ttk, psutil. На Windows дополнительно pywin32.
+1. `python app.py` -> The status bar should display "Event backend: active (WMI…)". 
+If it shows `unavailable`, the reason and the raw OS output will be
+displayed in the same location.
+2. Execute `cmd /c exit` in a loop (`for /l %i in (1,1,200) do @cmd /c exit`):
+verify that `START`/`EXIT` events are captured for each, with `source = WMI`,
+and no duplicates. Compare this with execution without administrator
+privileges (polling will miss some events).
+3. Check whether a process that is created and terminates between ticks (with a
+10-second interval) is detected.
+4. Verify the accuracy of `ParentProcessID` and the process chain; check that
+fields such as path, command line, and user are correctly reported (or
+correctly identified as `<n/a>` for very short-lived processes).
+5. Test `signature.check` using a signed executable (e.g., `notepad.exe`), an
+unsigned executable, and one with a corrupted signature; verify the
+reported statuses and the `CompanyName` field.
+6. Ensure proper handling of `NextEvent` when no events occur (timeout)—verify
+that there is no "busy-loop" (i.e., the application should not consume
+significant CPU resources while idle). 7. Closing the window: the WMI thread stops, and no process remains in the Task Manager.
+8. Dark window title bar (Win10 1809+/Win11); theme switching on the fly.
+9. `build.bat`: the executable launches, `windows.*` and pywin32 are included in the build, and a UAC prompt is triggered.
+10. Antivirus software and PyInstaller "onefile" builds (false positives are possible).
 
-## Статус проверки — читать первым
+## Known Limitations
 
-| Что | Статус |
-|---|---|
-| `core/` (идентификация, polling, события, история, хэширование, эвристики, воркеры), `presentation.py`, i18n | **Проверено автотестами и запусками в Linux** (62 теста) |
-| GUI (вкладки, смена языка, Ctrl+C, закрытие) | Проверено запуском под Xvfb (Linux), не на Windows |
-| `windows/wmi_events.py` (WMI process trace) | **Не запускалось на Windows.** Только статический разбор и проверка деградации на не-Windows |
-| `windows/signature.py` (Authenticode) | **Не запускалось на Windows.** Только статический разбор |
-| Тёмный заголовок окна (DWM), сборка `build.bat` | **Не проверялись на Windows** |
+- All points listed under "Verification Status" regarding Windows apply.
+- WMI subscription requires administrator privileges; the event provides only the PID, PPID, and process name.
+- Signature errors (expired, revoked, or hash mismatch) are not distinguished from one another.
+- The event backend for Linux/macOS is not implemented (though the `EventBackend` interface is ready); signatures are not verified on these platforms at all.
+- `handles` are reported only where `psutil` provides them (Windows).
+- Unused i18n keys that remain in the code: `col_flags`, `col_handles`, `d_chain`, `d_flags`, and `title`.
+- Persistence limitations are described in the "History and Persistence" section.
 
-Утверждений «на Windows работает» здесь нет и быть не может: среда разработки
-не Windows. Что именно проверить там — см. «Чек-лист для реальной Windows».
+## Changes from the Final Audit (Defects Identified and Fixed)
 
-## Архитектура
-
-```
-systema/
-├── app.py                 GUI (tkinter/ttk): только отрисовка и реакция на действия
-├── presentation.py        (code, params) и перечисления core -> текст на текущем языке; БЕЗ tkinter
-├── i18n.py                все строки RU/EN, определение языка ОС
-├── theme.py               палитры dark/light, DWM-заголовок окна (Windows)
-├── core/                  логика; не зависит ни от платформы, ни от GUI, ни от i18n
-│   ├── identity.py          ProcessKey(pid, create_time) — единый критерий «тот же процесс»
-│   ├── models.py             ProcessInfo, HistoryEvent, HeuristicHit, Severity, ...
-│   ├── backend.py            интерфейс EventBackend
-│   ├── polling_backend.py    снимки psutil + diff; единственный источник CPU/RAM/threads/handles
-│   ├── heuristics.py          RuleEngine -> HeuristicHit(code, severity, params)
-│   ├── hashing.py              SHA-256 в фоне, кэш по (путь, размер, mtime)
-│   ├── signature_worker.py     проверка подписи в фоне (чекер инжектируется)
-│   ├── history.py               история: bounded deque + асинхронная запись в SQLite
-│   ├── network.py                соединения процесса по запросу (psutil)
-│   └── monitor.py                ProcessMonitor — оркестратор
-├── windows/               Windows-специфика; подгружается лениво и только на win32
-│   ├── wmi_events.py        WMI process trace (event-driven START/EXIT)
-│   └── signature.py          Authenticode через WinVerifyTrust
-├── tests/                 pytest, 62 теста
-├── requirements.txt       runtime: psutil (+ pywin32 только на Windows)
-├── requirements-dev.txt   pytest, pyinstaller
-└── build.bat              сборка exe (PyInstaller)
-```
-
-Граф импортов — ациклический, направление одно: `app -> presentation -> core`,
-`windows -> core`, `core` не импортирует ничего из остального. Это не просто
-намерение: оно проверено — `core/*` импортируется при заблокированных
-`tkinter`, `pywin32`, `i18n`, `theme`, `app`. Старый плоский `monitor.py`
-удалён, ничто на него не ссылается.
-
-### Граница i18n
-
-**core возвращает только коды и структурированные данные; весь текст для
-человека рождается в `presentation.py` + `i18n.py`.**
-
-| Что отдаёт core | Как становится текстом |
-|---|---|
-| `HeuristicHit(code, severity, params)` | `i18n.t("reason_<code>", **params)` |
-| `HistoryEvent.reasons = [(code, params), ...]` | то же, в момент отображения |
-| `kind` = `START` / `EXIT` | `kind_start` / `kind_exit` |
-| `severity` | `sev_*` |
-| `ProcessMonitor.kill()` -> `"err_gone"` / `"err_denied"` / `"err_failed"` | ключ i18n с тем же именем |
-| `event_backend_status` = `disabled` / `active` / `unavailable` + `event_backend_error` (код) | `backend_*` / `backend_err_<код>` |
-
-Исключение, сделанное сознательно: **сырой текст исключений ОС**
-(`event_backend_detail`, `last_error_detail`) показывается как есть. Это
-динамические данные внешней системы, переводить нечего.
-
-Граница защищена тестами: нет кириллицы и нет английских предложений в
-runtime-строках `core/` и `windows/` (проверка через AST, исключая
-докстринги); у каждого кода правила есть шаблон на обоих языках, и тексты
-действительно различаются; наборы ключей и плейсхолдеров RU/EN совпадают;
-каждый ключ, на который ссылается GUI, существует. Guard-тесты проверены
-«мутацией» — нарушение, внесённое в core, они ловят.
-
-Смена языка на лету не оставляет смешанных строк: дерево «История событий»
-хранит уже отформатированный текст, поэтому при смене языка оно целиком
-перестраивается из `monitor.events` (источник истины — коды, а не текст).
-
-## Идентификация процессов
-
-`ProcessKey(pid, create_time)` — единственный критерий. Кэш статических полей
-в `PollingSource` ключится им; `ProcessMonitor` сравнивает через
-`same_process` (допуск 0.05 с, т.к. WMI и psutil округляют время по-разному).
-Переиспользование PID между тиками даёт пару **EXIT (старый) + START
-(новый)**, а не подавляется как «дубликат». Если при переиспользовании PID
-предков старого процесса восстановить нельзя, в EXIT показывается только
-достоверно известное имя.
-
-## События: WMI + polling
-
-- **Windows, с правами администратора:** `Win32_ProcessStartTrace` /
-  `Win32_ProcessStopTrace` через pywin32 в отдельном потоке; на START сразу
-  читаются путь/cmdline/пользователь, пока процесс жив. Ловит процессы,
-  которые родились и умерли между тиками polling.
-- **Иначе (не Windows, нет прав, нет pywin32):** diff снимков `PollingSource`.
-  Теряется только задержка до одного тика, состав данных тот же. Причина
-  недоступности видна в статус-баре.
-- **Polling работает всегда** — это единственный источник CPU/RAM/threads/
-  handles; события ОС таких данных не несут.
-- Дедупликация источников — общая таблица `_active` (`pid -> create_time`).
-  Процессы, работавшие при запуске приложения, заносятся в неё первым
-  снимком (иначе их EXIT терялся).
-
-Почему WMI, а не raw ETW: тот же трейсинг ядра, но через документированный
-COM-интерфейс уже необходимого pywin32; raw ETW из Python требует либо
-собственной ETW-сессии, либо слабо поддерживаемой сторонней обёртки.
-Цена — права администратора и то, что событие несёт только PID/PPID/имя.
-
-## История и персистентность
-
-- **В памяти** — `deque(maxlen=20000)`. GUI показывает не более 3000 последних
-  строк (`App.EVENT_ROW_CAP`).
-- **На диске** — SQLite `systema_history.sqlite3` в рабочем каталоге, запись
-  в отдельном потоке: `add()` не ждёт диск (~4 мкс), писатель сбрасывает
-  накопленное одной транзакцией (до 2000 строк).
-- **Формат:** `reasons` хранится как `[[code, params], ...]` JSON — коды, а не
-  переведённый текст; файл не привязан к языку интерфейса.
-- **Завершение:** `close()` ждёт полного досброса очереди (до 30 с) и
-  возвращает `True/False`. Измерено: 100 000 событий подряд — 0 потерь,
-  дренаж ~0.6 с. (Прежний таймаут 2 с терял 18 450 из 100 000.) Перед
-  `shutdown()` GUI останавливает и дожидается поток опроса, чтобы последний
-  `poll()` не добавил событие уже после закрытия истории.
-- **Намеренные ограничения (поведение сохранено, задокументировано):**
-  - после перезапуска вкладка «История событий» **пуста** — прошлые сессии в
-    GUI не подгружаются; они в SQLite (дописывается между запусками);
-  - при ошибке записи (диск полон и т.п.) текущий батч теряется,
-    причина сохраняется в `HistoryStore.write_error`, но в GUI **не
-    показывается**;
-  - очередь записи не ограничена по размеру;
-  - ротации/очистки файла БД нет.
-
-## Фоновые воркеры
-
-`HashWorker`, `SignatureWorker`, писатель SQLite — по одному потоку, очередь,
-кэш (кроме писателя). Гарантии, закреплённые тестами: повторный SHA-256 того
-же файла берётся из кэша; недоступный файл даёт `<n/a>`, а не зависание;
-процесс без пути к образу получает `<n/a>`, а не вечное «считается…»; падение
-callback'а не убивает поток и не портит кэш (результат доставляется ровно
-один раз, вне `try`); поток корректно останавливается через сентинел.
-
-## Эвристики и что означает уровень
-
-10 правил (`office-to-shell`, `browser-to-shell`, `temp-path`, `unusual-path`,
-`no-image`, `suspicious-cmdline`, `long-cmdline`, `masquerade`, `unsigned`,
-`untrusted-signature`) — набор и семантика не менялись. Уровень процесса —
-**максимум** среди сработавших правил.
-
-`LOW / MEDIUM / HIGH` означает «сработали такие-то эвристики», а не «это
-вредоносное ПО». Интерфейс говорит это прямо (строка под списком причин на
-вкладке «Безопасность / Файл»), а слов malware/virus в UI нет. Ложные
-срабатывания ожидаемы: например, легитимный установщик из `Downloads`
-получит `temp-path`.
-
-SHA-256 — факт о файле; подпись — факт `WinVerifyTrust` (все ошибки, кроме
-«нет подписи», сворачиваются в `untrusted`); «издатель» — это `CompanyName`
-из метаданных версии файла, **не** криптографическое доказательство личности
-(подписано так и в UI). Вкладка «Сеть» показывает соединения процесса и
-ничего не оценивает.
-
-## Интерфейс
-
-Вкладки: **Процессы** (дерево/список, фильтр, сортировка), **История
-событий**; для выбранного процесса — **Обзор**, **Безопасность / Файл**,
-**Связи**, **Сеть**. Текст в «Обзоре» выделяется мышью и копируется Ctrl+C
-(остаётся нередактируемым). Пустые состояния (ничего не выбрано, нет
-соединений, нет причин, нет родителя/детей) показываются локализованными
-сообщениями.
-
-CSV («Экспорт событий»): `kind`, `source`, `severity` — машинные значения без
-перевода, схема не зависит от языка; колонка `reasons` — текст на **текущем**
-языке интерфейса на момент экспорта.
-
-## Запуск
-
-```bash
-pip install -r requirements.txt
-python app.py
-```
-
-На Windows для event-driven backend — запуск от имени администратора; без
-него приложение работает на polling.
-
-## Тесты
-
-```bash
-pip install -r requirements-dev.txt
-pytest tests/ -v
-```
-
-62 теста, tkinter не нужен (логика рендера вынесена в `presentation.py`
-именно для этого). Покрыто: идентичность и PID reuse, правила эвристик,
-хэширование и кэш, воркеры (включая падающие callback'и), история (границы
-памяти, SQLite, всплеск, перезапуск), оркестратор (дедупликация WMI/polling,
-EXIT уже работавших процессов, PID reuse между тиками, `<n/a>` для хэша),
-граница i18n. Не покрыто автотестами: GUI целиком (проверялся запуском),
-`windows/*`.
-
-## Чек-лист для реальной Windows (не выполнялся)
-
-С правами администратора, в этом порядке:
-
-1. `python app.py` -> в статус-баре «Event backend: active (WMI…)». Если
-   `unavailable` — причина и сырой текст ОС показаны там же.
-2. `cmd /c exit` в цикле (`for /l %i in (1,1,200) do @cmd /c exit`): события
-   START/EXIT для каждого с `source = WMI`, без дублей. Сравнить с запуском
-   без прав администратора (polling пропустит часть).
-3. Процесс, рождающийся и умирающий между тиками при интервале 10 с — виден ли.
-4. Корректность `ParentProcessID`/цепочки; поля пути/cmdline/пользователя у
-   очень коротких процессов (ожидаемо `<n/a>`).
-5. `signature.check` на заведомо подписанном (`notepad.exe`), неподписанном и
-   с битой подписью; сверить статусы; проверить `CompanyName`.
-6. Обработка `NextEvent` при отсутствии событий (таймаут) — нет ли busy-loop
-   (загрузка CPU приложением в простое).
-7. Закрытие окна: поток WMI останавливается, процесс не остаётся в
-   диспетчере задач.
-8. Тёмный заголовок окна (Win10 1809+/Win11), смена темы на лету.
-9. `build.bat`: exe запускается, `windows.*` и pywin32 попали в сборку, запрос UAC.
-10. Антивирус и onefile-сборка PyInstaller (возможны ложные срабатывания).
-
-## Известные ограничения
-
-- Всё из раздела «Статус проверки» про Windows.
-- WMI-подписка требует администратора; событие несёт только PID/PPID/имя.
-- Ошибки подписи (истёк/отозван/хэш не совпал) не различаются.
-- Linux/macOS event-backend не реализован (интерфейс `EventBackend` готов);
-  подпись на этих платформах не проверяется вообще.
-- `handles` — только где их даёт psutil (Windows).
-- Неиспользуемые, но оставленные ключи i18n (не удалялись): `col_flags`,
-  `col_handles`, `d_chain`, `d_flags`, `title`.
-- Ограничения персистентности — в разделе «История и персистентность».
-
-## Что изменил финальный аудит (дефекты, найденные и исправленные)
-
-1. Причины эвристик были готовым русским текстом внутри `core` — не
-   переводились в английском интерфейсе, попадали в историю/SQLite/CSV
-   текстом. Теперь коды + параметры, перевод в UI.
-2. Строки «Истории событий» форматировались один раз и не менялись при смене
-   языка; `START/EXIT` вообще не локализовались. Теперь перестройка дерева.
-3. Диагностика бэкенда и ошибка `kill` были готовым английским текстом в
-   backend-коде. Теперь коды.
-4. `core/identity.py` не использовался (в polling был свой tuple и свой
-   допуск 0.001 против 0.05). Теперь единый `ProcessKey`.
-5. EXIT процессов, работавших при запуске, терялся (регрессия относительно
-   старого монитора); при переиспользовании PID между тиками START
-   подавлялся как дубликат. EXIT теперь несёт путь/cmdline/пользователя/хэш
-   из последнего снимка.
-6. SQLite: `close()` по таймауту 2 с молча терял хвост очереди (18 450 из
-   100 000); коммит на каждые 50 строк. Теперь жадные транзакции и ожидание
-   полного досброса.
-7. Гонка при закрытии: поток опроса не дожидался перед закрытием истории.
-8. Воркеры: исключение в callback приводило к повторной доставке с неверным
-   значением, порче кэша подписей и могло молча убить поток.
-9. SHA-256 у процессов без пути вечно показывал «считается…».
-10. Тесты требовали tkinter; рендер вынесен в `presentation.py`.
-11. `requirements.txt` смешивал runtime и dev-зависимости.
-12. Строка о том, что уровень — не вердикт, отсутствовала в UI.
+1. Heuristic descriptions were hardcoded as Russian text within the `core` module; they were not translated in the English interface and were stored as plain text in the history, SQLite database, and CSV files. They have been replaced with codes and parameters, with translation handled in the UI.
+2. "Event History" entries were formatted once and did not update when the language was changed; furthermore, `START/EXIT` labels were not localized at all. The system now rebuilds the tree structure to ensure proper localization. 3. Backend diagnostics and the `kill` error message were previously hardcoded as English text within the backend code; they have now been replaced with error codes.
+4. `core/identity.py` was not being used (the polling logic had its own tuple structure and a tolerance threshold of 0.001, compared to 0.05 elsewhere). This has been unified into a single `ProcessKey`.
+5. EXIT events for processes that were already running at startup were being lost (a regression compared to the previous monitor). Furthermore, if a PID was reused between polling ticks, the corresponding START event was incorrectly suppressed as a duplicate. EXIT events now include the path, command line, user, and hash derived from the most recent snapshot.
+6. SQLite: The `close()` operation, triggered by a 2-second timeout, was silently discarding the remainder of the queue (18,450 out of 100,000 entries). Commits were previously occurring every 50 rows; the system now uses "greedy" transactions and ensures the entire queue is flushed before closing.
+7. Race condition during shutdown: The polling thread was not being awaited before the history store was closed.
+8. Workers: An exception within a callback could lead to a retry with incorrect data, corruption of the signature cache, and the potential silent termination of the thread.
+9. For processes lacking a file path, the SHA-256 hash would remain stuck on "calculating..." indefinitely.
+10. Tests previously required `tkinter`; rendering logic has now been moved to `presentation.py`.
+11. `requirements.txt` contained a mix of runtime and development dependencies.
+12. A note clarifying that the "level" does not constitute a formal "verdict" was missing from the UI.
