@@ -1,0 +1,8 @@
+# Runtime-зависимости SYSTEMA Processes.
+psutil>=5.9
+
+# Только Windows: WMI process trace (windows/wmi_events.py), тёмный заголовок
+# окна (theme.py), CompanyName из VERSIONINFO (windows/signature.py). На
+# Linux/macOS не устанавливается и не нужен: core и GUI работают без него,
+# приложение откатывается на polling.
+pywin32>=306; sys_platform == "win32"
